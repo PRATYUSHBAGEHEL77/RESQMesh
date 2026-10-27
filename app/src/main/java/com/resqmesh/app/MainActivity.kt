@@ -534,68 +534,162 @@ private fun ResqScreen(
 ) {
     var sosText by remember { mutableStateOf("Need assistance. Please check this location.") }
 
-    Scaffold { padding ->
-        Column(
-            Modifier.fillMaxSize().padding(padding).padding(16.dp),
+    Scaffold(
+        topBar = {
+            Surface(shadowElevation = 3.dp) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
+                    Text("RESQMesh", style = MaterialTheme.typography.headlineMedium)
+                    Text(
+                        "OFFLINE SOS  •  FIELD TEST",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+    ) { padding ->
+        // One scrolling container for the entire screen. Previously the outer Column
+        // did not scroll, so the event log could be pushed below the viewport.
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("RESQMesh", style = MaterialTheme.typography.headlineMedium)
-            Text("Offline SOS mesh · field-test build", style = MaterialTheme.typography.bodyMedium)
-            Text("Keep this screen open during testing. Delivery is not guaranteed; this is not a certified emergency service.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-            OutlinedTextField(
-                value = name,
-                onValueChange = onNameChange,
-                label = { Text("Device name (unique per phone)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text(status, style = MaterialTheme.typography.bodyMedium)
-            Text(gpsStatus, style = MaterialTheme.typography.bodySmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onStart, enabled = !running, modifier = Modifier.weight(1f)) {
-                    Text("Start mesh")
-                }
-                OutlinedButton(onClick = onStop, enabled = running, modifier = Modifier.weight(1f)) {
-                    Text("Stop")
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "Prototype only — not a certified emergency service. Keep normal emergency options available.",
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
                 }
             }
-            Text("Connected peer IDs: ${peers.size}")
-            Text("A connected peer is not proof an SOS was received. Check the receipt acknowledgement in the event log.", style = MaterialTheme.typography.bodySmall)
-            peers.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
 
-            Divider()
-            Text("Send an SOS", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = sosText,
-                onValueChange = { sosText = it },
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 2,
-                label = { Text("SOS message") }
-            )
-            Button(onClick = { onSend(sosText) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Broadcast SOS with GPS")
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Device", style = MaterialTheme.typography.titleMedium)
+                        OutlinedTextField(
+                            value = name,
+                            onValueChange = onNameChange,
+                            label = { Text("Unique device name") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(
+                            status,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (status.contains("failed", true) || status.contains("denied", true))
+                                MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                        )
+                        Text("Location: $gpsStatus", style = MaterialTheme.typography.bodySmall)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onStart, enabled = !running, modifier = Modifier.weight(1f)) {
+                                Text("Start mesh")
+                            }
+                            OutlinedButton(onClick = onStop, enabled = running, modifier = Modifier.weight(1f)) {
+                                Text("Stop")
+                            }
+                        }
+                        Text(
+                            "Connected peers: ${peers.size}",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        if (peers.isNotEmpty()) {
+                            peers.forEach { peer ->
+                                Text("• $peer", style = MaterialTheme.typography.bodySmall)
+                            }
+                        } else {
+                            Text("No peers connected yet.", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
             }
-            OutlinedButton(onClick = { onSendWithoutGps(sosText) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Send without GPS (fallback)")
+
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Send an SOS", style = MaterialTheme.typography.titleLarge)
+                        OutlinedTextField(
+                            value = sosText,
+                            onValueChange = { sosText = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            minLines = 3,
+                            label = { Text("Emergency message") },
+                            placeholder = { Text("Describe what help is needed") }
+                        )
+                        Button(
+                            onClick = { onSend(sosText) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Broadcast SOS with GPS")
+                        }
+                        OutlinedButton(
+                            onClick = { onSendWithoutGps(sosText) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Send without GPS")
+                        }
+                        Text(
+                            "A peer receipt confirms app-to-app delivery only. It does not contact emergency services.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
             }
-            Text(
-                "Prototype only: GPS is attached only when a real fix is obtained. An ACK means another app node received the message, not that emergency services were notified.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error
-            )
-            Divider()
-            Text("Event log", style = MaterialTheme.typography.titleMedium)
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(events, key = { it.id }) { event ->
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                ) {
+                    Text("Event log", style = MaterialTheme.typography.titleLarge)
+                    Text("${events.size} events", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+
+            if (events.isEmpty()) {
+                item {
                     Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(10.dp)) {
-                            Text("${event.kind} · ${event.text}", style = MaterialTheme.typography.titleSmall)
-                            Text(event.detail, style = MaterialTheme.typography.bodySmall)
+                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("No events yet", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "Connection changes, SOS sends, received messages, GPS status and receipt acknowledgements will appear here.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            } else {
+                items(events, key = { it.id }) { event ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = when (event.kind) {
+                                "SOS" -> MaterialTheme.colorScheme.primaryContainer
+                                "ACK" -> MaterialTheme.colorScheme.tertiaryContainer
+                                else -> MaterialTheme.colorScheme.surfaceVariant
+                            }
+                        )
+                    ) {
+                        Column(
+                            Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Text("${event.kind}  •  ${event.text}", style = MaterialTheme.typography.titleSmall)
+                            Text(event.detail, style = MaterialTheme.typography.bodyMedium)
                             if (event.latitude != null && event.longitude != null) {
-                                Text("Coordinates: ${event.latitude}, ${event.longitude}", style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    "Coordinates: ${event.latitude}, ${event.longitude}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                                 TextButton(onClick = { onOpenMap(event.latitude, event.longitude) }) {
                                     Text("OPEN LOCATION IN MAPS")
                                 }
