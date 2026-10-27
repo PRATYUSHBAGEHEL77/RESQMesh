@@ -2,8 +2,14 @@ package com.resqmesh.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,6 +47,19 @@ class MainActivity : ComponentActivity() {
     private var localName by mutableStateOf("RESQ-Phone")
     private var status by mutableStateOf("Offline. Start mesh on each test phone.")
     private var running by mutableStateOf(false)
+    private var gpsStatus by mutableStateOf("GPS not requested yet.")
+    private var pendingSosText by mutableStateOf("")
+
+    private val gpsPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+            val fineGranted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
+            if (fineGranted) {
+                acquireGpsAndSend(pendingSosText)
+            } else {
+                gpsStatus = "Precise location permission denied. You can choose to send without GPS."
+                addEvent("SYSTEM", "GPS permission denied", "No coordinates were attached.")
+            }
+        }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -61,12 +80,14 @@ class MainActivity : ComponentActivity() {
                         name = localName,
                         onNameChange = { localName = it.take(24) },
                         status = status,
+                        gpsStatus = gpsStatus,
                         running = running,
                         peers = peerState.toList(),
                         events = eventState.toList(),
                         onStart = { requestPermissionsAndStart() },
                         onStop = { stopMesh() },
-                        onSend = { message -> sendSos(message) }
+                        onSend = { message -> requestGpsAndSend(message) },
+                        onSendWithoutGps = { message -> sendSos(message, null) }
                     )
                 }
             }
@@ -204,7 +225,71 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun sendSos(message: String) {
+    private fun requestGpsAndSend(message: String) {
+        val clean = message.trim()
+        if (clean.isEmpty()) {
+            addEvent("SYSTEM", "SOS not sent", "Enter a short message first.")
+            return
+        }
+        pendingSosText = clean
+        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted) {
+            gpsPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+            return
+        }
+        acquireGpsAndSend(clean)
+    }
+
+    @Suppress("MissingPermission", "DEPRECATION")
+    private fun acquireGpsAndSend(message: String) {
+        val locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            gpsStatus = "GPS is off. Enable Location/GPS, then try again, or send without GPS."
+            addEvent("SYSTEM", "GPS unavailable", "Device GPS is disabled; no coordinates attached.")
+            return
+        }
+        gpsStatus = "Getting a GPS fix… this may take a little time, especially indoors."
+        val cancellation = CancellationSignal()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            locationManager.getCurrentLocation(LocationManager.GPS_PROVIDER, cancellation, mainExecutor) { location ->
+                if (location != null) {
+                    gpsStatus = "GPS fix: ±${location.accuracy.toInt()} m"
+                    sendSos(message, location)
+                } else {
+                    gpsStatus = "No GPS fix yet. Move near a window/outdoors and retry, or send without GPS."
+                    addEvent("SYSTEM", "GPS fix unavailable", "No fabricated coordinates were attached.")
+                }
+            }
+        } else {
+            val handler = Handler(Looper.getMainLooper())
+            var completed = false
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    if (completed) return
+                    completed = true
+                    handler.removeCallbacksAndMessages(null)
+                    runCatching { locationManager.removeUpdates(this) }
+                    gpsStatus = "GPS fix: ±${location.accuracy.toInt()} m"
+                    sendSos(message, location)
+                }
+                @Deprecated("Deprecated by Android")
+                override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) = Unit
+                override fun onProviderEnabled(provider: String) = Unit
+                override fun onProviderDisabled(provider: String) = Unit
+            }
+            locationManager.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper())
+            handler.postDelayed({
+                if (!completed) {
+                    completed = true
+                    runCatching { locationManager.removeUpdates(listener) }
+                    gpsStatus = "GPS fix timed out. Try outdoors or send without GPS."
+                    addEvent("SYSTEM", "GPS fix timed out", "No coordinates were attached.")
+                }
+            }, 20000L)
+        }
+    }
+
+    private fun sendSos(message: String, location: Location?) {
         val clean = message.trim()
         if (clean.isEmpty()) {
             addEvent("SYSTEM", "SOS not sent", "Enter a short message first.")
@@ -218,10 +303,20 @@ class MainActivity : ComponentActivity() {
             .put("origin", localName.ifBlank { "RESQ-Phone" })
             .put("text", clean.take(500))
             .put("createdAt", System.currentTimeMillis())
+            .put("latitude", if (location != null) location.latitude else JSONObject.NULL)
+            .put("longitude", if (location != null) location.longitude else JSONObject.NULL)
+            .put("accuracyMeters", if (location != null) location.accuracy else JSONObject.NULL)
+            .put("locationTimestamp", if (location != null) location.time else JSONObject.NULL)
+            .put("locationProvider", if (location != null) location.provider else JSONObject.NULL)
             .put("ttl", MAX_HOPS)
             .put("hops", 0)
             .put("path", org.json.JSONArray().put(localName))
-        addEvent("SOS", "SOS created", "$id · not yet acknowledged by a recipient")
+        val locationDetail = if (location != null) {
+            "GPS ${location.latitude}, ${location.longitude} · ±${location.accuracy.toInt()} m · ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(location.time))}"
+        } else {
+            "No GPS coordinates attached (user-selected fallback)."
+        }
+        addEvent("SOS", "SOS created", "$id · $locationDetail · not yet acknowledged by a recipient")
         broadcast(envelope, excludeEndpoint = null)
         if (connected.isEmpty()) {
             addEvent("SYSTEM", "No connected peers", "SOS is not transmitted yet; this prototype does not persist it.")
@@ -244,7 +339,13 @@ class MainActivity : ComponentActivity() {
             "SOS" -> {
                 val origin = envelope.optString("origin", "Unknown")
                 val text = envelope.optString("text", "(empty SOS)")
-                addEvent("SOS", "SOS received from $origin", "$text · id=$id · hops=$hops")
+                val latitude = envelope.opt("latitude")
+                val longitude = envelope.opt("longitude")
+                val locationDetail = if (latitude != null && latitude != JSONObject.NULL && longitude != null && longitude != JSONObject.NULL) {
+                    val accuracy = envelope.opt("accuracyMeters").let { if (it != null && it != JSONObject.NULL) " · ±${(it as Number).toFloat().toInt()} m" else "" }
+                    " · GPS=$latitude,$longitude$accuracy"
+                } else " · no GPS coordinates"
+                addEvent("SOS", "SOS received from $origin", "$text · id=$id · hops=$hops$locationDetail")
                 // This ACK means this node received the SOS; it is not a rescue-service acknowledgement.
                 val ack = JSONObject()
                     .put("kind", "ACK")
@@ -308,12 +409,14 @@ private fun ResqScreen(
     name: String,
     onNameChange: (String) -> Unit,
     status: String,
+    gpsStatus: String,
     running: Boolean,
     peers: List<String>,
     events: List<UiEvent>,
     onStart: () -> Unit,
     onStop: () -> Unit,
-    onSend: (String) -> Unit
+    onSend: (String) -> Unit,
+    onSendWithoutGps: (String) -> Unit
 ) {
     var sosText by remember { mutableStateOf("Need assistance. Please check this location.") }
 
@@ -332,6 +435,7 @@ private fun ResqScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Text(status, style = MaterialTheme.typography.bodyMedium)
+            Text(gpsStatus, style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onStart, enabled = !running, modifier = Modifier.weight(1f)) {
                     Text("Start mesh")
@@ -353,10 +457,13 @@ private fun ResqScreen(
                 label = { Text("SOS message") }
             )
             Button(onClick = { onSend(sosText) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Broadcast SOS")
+                Text("Broadcast SOS with GPS")
+            }
+            OutlinedButton(onClick = { onSendWithoutGps(sosText) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Send without GPS (fallback)")
             }
             Text(
-                "Prototype only: no GPS location is attached. An ACK means another app node received the message, not that emergency services were notified.",
+                "Prototype only: GPS is attached only when a real fix is obtained. An ACK means another app node received the message, not that emergency services were notified.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
             )
