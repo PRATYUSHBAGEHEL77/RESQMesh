@@ -57,11 +57,13 @@ class MainActivity : ComponentActivity() {
     private val gpsPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             val fineGranted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true
-            if (fineGranted) {
+            val coarseGranted = result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+            if (fineGranted || coarseGranted) {
                 acquireGpsAndSend(pendingSosText)
             } else {
-                gpsStatus = "Precise location permission denied. You can choose to send without GPS."
-                addEvent("SYSTEM", "GPS permission denied", "No coordinates were attached.")
+                gpsStatus = "Location permission denied. Sending SOS without coordinates so the message is not blocked."
+                addEvent("SYSTEM", "Location permission denied", "SOS will be sent without coordinates.")
+                sendSos(pendingSosText, null)
             }
         }
 
@@ -253,7 +255,8 @@ class MainActivity : ComponentActivity() {
         }
         pendingSosText = clean
         val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        if (!fineGranted) {
+        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) {
             gpsPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
             return
         }
@@ -263,49 +266,103 @@ class MainActivity : ComponentActivity() {
     @Suppress("MissingPermission", "DEPRECATION")
     private fun acquireGpsAndSend(message: String) {
         val locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            gpsStatus = "GPS is off. Enable Location/GPS, then try again, or send without GPS."
-            addEvent("SYSTEM", "GPS unavailable", "Device GPS is disabled; no coordinates attached.")
+        val hasFinePermission = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val providers = if (hasFinePermission) {
+            listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+        } else {
+            listOf(LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+        }
+        val enabledProviders = providers.filter { provider ->
+            runCatching { locationManager.isProviderEnabled(provider) }.getOrDefault(false)
+        }
+        if (enabledProviders.isEmpty()) {
+            gpsStatus = "Device Location is off. Sending SOS without coordinates; enable Location and retry for GPS."
+            addEvent("SYSTEM", "Location unavailable", "All location providers are disabled; SOS is sent without coordinates.")
+            sendSos(message, null)
             return
         }
-        gpsStatus = "Getting a GPS fix… this may take a little time, especially indoors."
-        val cancellation = CancellationSignal()
+
+        // Prefer a recent real fix so the SOS is not blocked waiting for a cold GPS start.
+        val now = System.currentTimeMillis()
+        val recent = enabledProviders.mapNotNull { provider ->
+            runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull()
+        }.filter { now - it.time in 0..300_000L }
+            .maxByOrNull { it.time }
+        if (recent != null) {
+            gpsStatus = "Using recent location from ${recent.provider} (±${recent.accuracy.toInt()} m)."
+            sendSos(message, recent)
+            return
+        }
+
+        gpsStatus = "Getting location… SOS will still be sent if a fix is unavailable."
+        addEvent("SYSTEM", "Location requested", "Trying enabled providers; SOS will not be blocked indefinitely.")
+        val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
+        val cancellation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) CancellationSignal() else null
+        val timeout = Runnable {
+            if (completed.compareAndSet(false, true)) {
+                cancellation?.cancel()
+                gpsStatus = "Location timed out. SOS sent without coordinates; move outdoors and try again for a fix."
+                addEvent("SYSTEM", "Location timeout", "SOS sent without coordinates rather than being silently blocked.")
+                sendSos(message, null)
+            }
+        }
+        handler.postDelayed(timeout, 15_000L)
+
+        val provider = when {
+            hasFinePermission && enabledProviders.contains(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+            enabledProviders.contains(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+            else -> enabledProviders.first()
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            locationManager.getCurrentLocation(LocationManager.GPS_PROVIDER, cancellation, mainExecutor) { location ->
-                if (location != null) {
-                    gpsStatus = "GPS fix: ±${location.accuracy.toInt()} m"
-                    sendSos(message, location)
-                } else {
-                    gpsStatus = "No GPS fix yet. Move near a window/outdoors and retry, or send without GPS."
-                    addEvent("SYSTEM", "GPS fix unavailable", "No fabricated coordinates were attached.")
+            try {
+                locationManager.getCurrentLocation(provider, cancellation, mainExecutor) { location ->
+                    if (completed.compareAndSet(false, true)) {
+                        handler.removeCallbacks(timeout)
+                        if (location != null) {
+                            gpsStatus = "Location fix from ${location.provider}: ±${location.accuracy.toInt()} m."
+                            sendSos(message, location)
+                        } else {
+                            gpsStatus = "No location fix. SOS sent without coordinates."
+                            addEvent("SYSTEM", "Location fix unavailable", "SOS sent without coordinates; no location was invented.")
+                            sendSos(message, null)
+                        }
+                    }
+                }
+            } catch (e: SecurityException) {
+                if (completed.compareAndSet(false, true)) {
+                    handler.removeCallbacks(timeout)
+                    gpsStatus = "Location permission error. SOS sent without coordinates."
+                    addEvent("SYSTEM", "Location permission error", e.localizedMessage ?: "Permission unavailable")
+                    sendSos(message, null)
                 }
             }
         } else {
-            val handler = Handler(Looper.getMainLooper())
-            var completed = false
             val listener = object : LocationListener {
                 override fun onLocationChanged(location: Location) {
-                    if (completed) return
-                    completed = true
-                    handler.removeCallbacksAndMessages(null)
-                    runCatching { locationManager.removeUpdates(this) }
-                    gpsStatus = "GPS fix: ±${location.accuracy.toInt()} m"
-                    sendSos(message, location)
+                    if (completed.compareAndSet(false, true)) {
+                        handler.removeCallbacks(timeout)
+                        runCatching { locationManager.removeUpdates(this) }
+                        gpsStatus = "Location fix from ${location.provider}: ±${location.accuracy.toInt()} m."
+                        sendSos(message, location)
+                    }
                 }
                 @Deprecated("Deprecated by Android")
                 override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) = Unit
                 override fun onProviderEnabled(provider: String) = Unit
                 override fun onProviderDisabled(provider: String) = Unit
             }
-            locationManager.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper())
-            handler.postDelayed({
-                if (!completed) {
-                    completed = true
-                    runCatching { locationManager.removeUpdates(listener) }
-                    gpsStatus = "GPS fix timed out. Try outdoors or send without GPS."
-                    addEvent("SYSTEM", "GPS fix timed out", "No coordinates were attached.")
+            try {
+                locationManager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            } catch (e: SecurityException) {
+                if (completed.compareAndSet(false, true)) {
+                    handler.removeCallbacks(timeout)
+                    gpsStatus = "Location permission error. SOS sent without coordinates."
+                    addEvent("SYSTEM", "Location permission error", e.localizedMessage ?: "Permission unavailable")
+                    sendSos(message, null)
                 }
-            }, 20000L)
+            }
+            handler.postDelayed({ if (completed.get()) runCatching { locationManager.removeUpdates(listener) } }, 16_000L)
         }
     }
 
@@ -389,7 +446,9 @@ class MainActivity : ComponentActivity() {
                     .put("ttl", MAX_HOPS)
                     .put("hops", 0)
                 seenIds.add(ack.getString("id"))
-                broadcast(ack, excludeEndpoint = fromEndpoint)
+                // ACK must be sent BACK to the sender. Excluding fromEndpoint here
+                // accidentally prevented the original phone from ever seeing confirmation.
+                sendToEndpoint(fromEndpoint, ack)
                 if (ttl > 0) {
                     val forwarded = JSONObject(envelope.toString())
                         .put("ttl", ttl - 1)
@@ -412,9 +471,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun sendToEndpoint(endpointId: String, envelope: JSONObject) {
+        if (!connected.containsKey(endpointId)) {
+            addEvent("SYSTEM", "ACK NOT SENT", "The sender disconnected before the receipt acknowledgement could be delivered.")
+            return
+        }
+        val payload = Payload.fromBytes(envelope.toString().toByteArray(Charsets.UTF_8))
+        client.sendPayload(endpointId, payload)
+            .addOnSuccessListener {
+                addEvent("SYSTEM", "Receipt ACK queued", "Sent to the originating connected peer; this confirms app-to-app receipt only.")
+            }
+            .addOnFailureListener { e ->
+                addEvent("SYSTEM", "ACK SEND FAILED", e.localizedMessage ?: e.javaClass.simpleName)
+            }
+    }
+
     private fun broadcast(envelope: JSONObject, excludeEndpoint: String?) {
         val recipients = connected.keys.filter { it != excludeEndpoint }
-        if (recipients.isEmpty()) return
+        if (recipients.isEmpty()) {
+            addEvent("SYSTEM", "No relay recipients", "No eligible connected peers for this message.")
+            return
+        }
         val payload = Payload.fromBytes(envelope.toString().toByteArray(Charsets.UTF_8))
         client.sendPayload(recipients, payload)
             .addOnSuccessListener {
