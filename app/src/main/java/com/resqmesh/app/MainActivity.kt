@@ -2,6 +2,8 @@ package com.resqmesh.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.Intent
+import android.net.Uri
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -34,7 +36,9 @@ data class UiEvent(
     val id: String,
     val kind: String,
     val text: String,
-    val detail: String
+    val detail: String,
+    val latitude: Double? = null,
+    val longitude: Double? = null
 )
 
 class MainActivity : ComponentActivity() {
@@ -73,6 +77,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Give each installation a distinct default name so two untouched phones can discover one another.
+        if (localName == "RESQ-Phone") {
+            val androidId = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: UUID.randomUUID().toString()
+            val model = Build.MODEL.orEmpty().replace(Regex("[^A-Za-z0-9]"), "").take(8).ifBlank { "Phone" }
+            localName = "RESQ-$model-${androidId.takeLast(4)}"
+        }
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -87,7 +97,8 @@ class MainActivity : ComponentActivity() {
                         onStart = { requestPermissionsAndStart() },
                         onStop = { stopMesh() },
                         onSend = { message -> requestGpsAndSend(message) },
-                        onSendWithoutGps = { message -> sendSos(message, null) }
+                        onSendWithoutGps = { message -> sendSos(message, null) },
+                        onOpenMap = { lat, lon -> openMap(lat, lon) }
                     )
                 }
             }
@@ -215,8 +226,17 @@ class MainActivity : ComponentActivity() {
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             if (payload.type != Payload.Type.BYTES) return
-            val bytes = payload.asBytes() ?: return
-            val json = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrNull() ?: return
+            val bytes = payload.asBytes()
+            if (bytes == null) {
+                addEvent("SYSTEM", "Received empty payload", "Endpoint=$endpointId")
+                return
+            }
+            val raw = String(bytes, Charsets.UTF_8)
+            val json = runCatching { JSONObject(raw) }.getOrElse {
+                addEvent("SYSTEM", "Received unreadable message", "Endpoint=$endpointId · ${it.localizedMessage ?: "invalid JSON"}")
+                return
+            }
+            addEvent("SYSTEM", "Payload received from peer", "Endpoint=$endpointId · ${bytes.size} bytes")
             handleIncoming(endpointId, json)
         }
 
@@ -289,6 +309,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun openMap(latitude: Double, longitude: Double) {
+        // Opens an installed maps app if available. Offline maps must be downloaded in that app beforehand.
+        val uri = Uri.parse("geo:$latitude,$longitude?q=$latitude,$longitude(RESQMesh%20SOS)")
+        val intent = Intent(Intent.ACTION_VIEW, uri)
+        runCatching { startActivity(intent) }
+            .onFailure { addEvent("SYSTEM", "Could not open map", "Coordinates: $latitude, $longitude. Open them in a maps app manually.", latitude, longitude) }
+    }
+
     private fun sendSos(message: String, location: Location?) {
         val clean = message.trim()
         if (clean.isEmpty()) {
@@ -316,10 +344,11 @@ class MainActivity : ComponentActivity() {
         } else {
             "No GPS coordinates attached (user-selected fallback)."
         }
-        addEvent("SOS", "SOS created", "$id · $locationDetail · not yet acknowledged by a recipient")
-        broadcast(envelope, excludeEndpoint = null)
+        addEvent("SOS", "SOS created", "$id · $locationDetail · waiting for peer receipt", location?.latitude, location?.longitude)
         if (connected.isEmpty()) {
-            addEvent("SYSTEM", "No connected peers", "SOS is not transmitted yet; this prototype does not persist it.")
+            addEvent("SYSTEM", "SOS NOT SENT", "No connected peers. Keep the app open and retry when a peer connects.", location?.latitude, location?.longitude)
+        } else {
+            broadcast(envelope, excludeEndpoint = null)
         }
     }
 
@@ -345,7 +374,11 @@ class MainActivity : ComponentActivity() {
                     val accuracy = envelope.opt("accuracyMeters").let { if (it != null && it != JSONObject.NULL) " · ±${(it as Number).toFloat().toInt()} m" else "" }
                     " · GPS=$latitude,$longitude$accuracy"
                 } else " · no GPS coordinates"
-                addEvent("SOS", "SOS received from $origin", "$text · id=$id · hops=$hops$locationDetail")
+                val latitudeValue = envelope.opt("latitude")
+                val longitudeValue = envelope.opt("longitude")
+                val receivedLat = if (latitudeValue is Number) latitudeValue.toDouble() else null
+                val receivedLon = if (longitudeValue is Number) longitudeValue.toDouble() else null
+                addEvent("SOS", "SOS RECEIVED from $origin", "$text · id=$id · hops=$hops$locationDetail", receivedLat, receivedLon)
                 // This ACK means this node received the SOS; it is not a rescue-service acknowledgement.
                 val ack = JSONObject()
                     .put("kind", "ACK")
@@ -368,7 +401,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             "ACK" -> {
-                addEvent("ACK", "Peer receipt acknowledgement", "SOS=${envelope.optString("originalId")} · received by ${envelope.optString("ackBy")}")
+                addEvent("ACK", "SOS RECEIPT CONFIRMED", "SOS=${envelope.optString("originalId")} · received by ${envelope.optString("ackBy")}. This confirms app-to-app receipt only.")
                 if (ttl > 0) {
                     val forwarded = JSONObject(envelope.toString())
                         .put("ttl", ttl - 1)
@@ -384,14 +417,17 @@ class MainActivity : ComponentActivity() {
         if (recipients.isEmpty()) return
         val payload = Payload.fromBytes(envelope.toString().toByteArray(Charsets.UTF_8))
         client.sendPayload(recipients, payload)
+            .addOnSuccessListener {
+                addEvent("SYSTEM", "Payload handed to nearby transport", "Target peers: ${recipients.size}. This is not proof of receipt; wait for SOS RECEIPT CONFIRMED.")
+            }
             .addOnFailureListener { e ->
-                addEvent("SYSTEM", "Send failed", "to ${recipients.size} peer(s): ${e.localizedMessage}")
+                addEvent("SYSTEM", "SEND FAILED", "to ${recipients.size} peer(s): ${e.localizedMessage ?: e.javaClass.simpleName}")
             }
     }
 
-    private fun addEvent(kind: String, text: String, detail: String) {
+    private fun addEvent(kind: String, text: String, detail: String, latitude: Double? = null, longitude: Double? = null) {
         runOnUiThread {
-            eventState.add(0, UiEvent(UUID.randomUUID().toString(), kind, text, detail))
+            eventState.add(0, UiEvent(UUID.randomUUID().toString(), kind, text, detail, latitude, longitude))
             while (eventState.size > 150) eventState.removeAt(eventState.lastIndex)
         }
     }
@@ -416,7 +452,8 @@ private fun ResqScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onSend: (String) -> Unit,
-    onSendWithoutGps: (String) -> Unit
+    onSendWithoutGps: (String) -> Unit,
+    onOpenMap: (Double, Double) -> Unit
 ) {
     var sosText by remember { mutableStateOf("Need assistance. Please check this location.") }
 
@@ -426,7 +463,8 @@ private fun ResqScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("RESQMesh", style = MaterialTheme.typography.headlineMedium)
-            Text("Offline SOS mesh prototype", style = MaterialTheme.typography.bodyMedium)
+            Text("Offline SOS mesh · field-test build", style = MaterialTheme.typography.bodyMedium)
+            Text("Keep this screen open during testing. Delivery is not guaranteed; this is not a certified emergency service.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             OutlinedTextField(
                 value = name,
                 onValueChange = onNameChange,
@@ -445,6 +483,7 @@ private fun ResqScreen(
                 }
             }
             Text("Connected peer IDs: ${peers.size}")
+            Text("A connected peer is not proof an SOS was received. Check the receipt acknowledgement in the event log.", style = MaterialTheme.typography.bodySmall)
             peers.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
 
             Divider()
@@ -478,6 +517,12 @@ private fun ResqScreen(
                         Column(Modifier.padding(10.dp)) {
                             Text("${event.kind} · ${event.text}", style = MaterialTheme.typography.titleSmall)
                             Text(event.detail, style = MaterialTheme.typography.bodySmall)
+                            if (event.latitude != null && event.longitude != null) {
+                                Text("Coordinates: ${event.latitude}, ${event.longitude}", style = MaterialTheme.typography.bodySmall)
+                                TextButton(onClick = { onOpenMap(event.latitude, event.longitude) }) {
+                                    Text("OPEN LOCATION IN MAPS")
+                                }
+                            }
                         }
                     }
                 }
