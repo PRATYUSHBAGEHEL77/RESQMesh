@@ -12,8 +12,8 @@ android {
         applicationId = "com.resqmesh.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
     }
 
     buildFeatures { compose = true }
@@ -35,4 +35,5 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("com.google.android.gms:play-services-nearby:19.3.0")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
 }

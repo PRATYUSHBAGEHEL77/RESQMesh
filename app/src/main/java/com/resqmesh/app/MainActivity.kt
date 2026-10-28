@@ -28,12 +28,15 @@ import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
 import org.json.JSONObject
 import java.util.UUID
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 private const val SERVICE_ID = "com.resqmesh.app.SOS"
 private const val MAX_HOPS = 5
 
 data class PendingPeer(val endpointId: String, val name: String, val digits: String)
+
+data class TransferTrack(val messageId: String, val kind: String, val remainingEndpoints: MutableSet<String>)
 
 data class UiEvent(
     val id: String,
@@ -49,6 +52,9 @@ class MainActivity : ComponentActivity() {
 
     private val connected = ConcurrentHashMap<String, String>() // endpointId -> endpointName
     private val seenIds = ConcurrentHashMap.newKeySet<String>()
+    // Nearby transport payload ID -> (application message ID, kind). Transport completion
+    // is distinct from recipient processing and app-level acknowledgement.
+    private val outgoingPayloads = ConcurrentHashMap<Long, TransferTrack>()
     private val eventState = mutableStateListOf<UiEvent>()
     private val pendingPeerState = mutableStateListOf<PendingPeer>()
     private val prefs: SharedPreferences by lazy { getSharedPreferences("resqmesh_durable", MODE_PRIVATE) }
@@ -258,7 +264,28 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Small BYTES payloads complete quickly; events are logged on receipt instead.
+            val tracked = outgoingPayloads[update.payloadId] ?: return
+            val messageId = tracked.messageId
+            val kind = tracked.kind
+            when (update.status) {
+                PayloadTransferUpdate.Status.IN_PROGRESS ->
+                    addEvent("SYSTEM", "$kind SENDING", "$messageId · peer=$endpointId · ${update.bytesTransferred}/${update.totalBytes} bytes")
+                PayloadTransferUpdate.Status.SUCCESS -> {
+                    addEvent("SYSTEM", "$kind SENT", "$messageId · transport completed to peer=$endpointId. This is not proof the receiver processed it; wait for an app ACK.")
+                    tracked.remainingEndpoints.remove(endpointId)
+                    if (tracked.remainingEndpoints.isEmpty()) outgoingPayloads.remove(update.payloadId)
+                }
+                PayloadTransferUpdate.Status.FAILURE -> {
+                    addEvent("SYSTEM", "$kind SEND FAILED", "$messageId · peer=$endpointId · transport failed. Pending SOS remains queued for retry.")
+                    tracked.remainingEndpoints.remove(endpointId)
+                    if (tracked.remainingEndpoints.isEmpty()) outgoingPayloads.remove(update.payloadId)
+                }
+                PayloadTransferUpdate.Status.CANCELED -> {
+                    addEvent("SYSTEM", "$kind SEND CANCELED", "$messageId · peer=$endpointId")
+                    tracked.remainingEndpoints.remove(endpointId)
+                    if (tracked.remainingEndpoints.isEmpty()) outgoingPayloads.remove(update.payloadId)
+                }
+            }
         }
     }
 
@@ -304,7 +331,7 @@ class MainActivity : ComponentActivity() {
         }.filter { now - it.time in 0..300_000L }
             .maxByOrNull { it.time }
         if (recent != null) {
-            gpsStatus = "Using recent location from ${recent.provider} (±${recent.accuracy.toInt()} m)."
+            gpsStatus = "CACHED location · provider=${recent.provider} · accuracy ±${recent.accuracy.toInt()} m · age=${((now - recent.time).coerceAtLeast(0L) / 1000)}s · captured=${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(recent.time))}. Not a fresh fix."
             sendSos(message, recent)
             return
         }
@@ -335,7 +362,7 @@ class MainActivity : ComponentActivity() {
                     if (completed.compareAndSet(false, true)) {
                         handler.removeCallbacks(timeout)
                         if (location != null) {
-                            gpsStatus = "Location fix from ${location.provider}: ±${location.accuracy.toInt()} m."
+                            gpsStatus = "CURRENT fix · provider=${location.provider} · accuracy ±${location.accuracy.toInt()} m · captured=${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(location.time))}."
                             sendSos(message, location)
                         } else {
                             gpsStatus = "No location fix. SOS sent without coordinates."
@@ -358,7 +385,7 @@ class MainActivity : ComponentActivity() {
                     if (completed.compareAndSet(false, true)) {
                         handler.removeCallbacks(timeout)
                         runCatching { locationManager.removeUpdates(this) }
-                        gpsStatus = "Location fix from ${location.provider}: ±${location.accuracy.toInt()} m."
+                        gpsStatus = "CURRENT fix · provider=${location.provider} · accuracy ±${location.accuracy.toInt()} m · captured=${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(location.time))}."
                         sendSos(message, location)
                     }
                 }
@@ -382,11 +409,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openMap(latitude: Double, longitude: Double) {
-        // Opens an installed maps app if available. Offline maps must be downloaded in that app beforehand.
-        val uri = Uri.parse("geo:$latitude,$longitude?q=$latitude,$longitude(RESQMesh%20SOS)")
-        val intent = Intent(Intent.ACTION_VIEW, uri)
+        // In-app map uses cached OSM tiles. The area and zoom levels must be viewed online first.
+        val intent = Intent(this, OfflineMapActivity::class.java)
+            .putExtra("latitude", latitude)
+            .putExtra("longitude", longitude)
         runCatching { startActivity(intent) }
-            .onFailure { addEvent("SYSTEM", "Could not open map", "Coordinates: $latitude, $longitude. Open them in a maps app manually.", latitude, longitude) }
+            .onFailure {
+                addEvent("SYSTEM", "Could not open in-app map", "Coordinates: $latitude, $longitude. Check map screen installation.", latitude, longitude)
+            }
     }
 
     private fun sendSos(message: String, location: Location?) {
@@ -426,9 +456,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIncoming(fromEndpoint: String, envelope: JSONObject) {
+        if (!verifyEnvelopeIntegrity(envelope)) {
+            addEvent("SECURITY", "MESSAGE INTEGRITY CHECK FAILED", "Rejected a payload with a missing or mismatched SHA-256 checksum from endpoint=$fromEndpoint. This detects accidental changes; it is not a cryptographic sender identity proof.")
+            return
+        }
         val kind = envelope.optString("kind", "")
         val id = envelope.optString("id", "")
-        if (id.isBlank() || kind !in setOf("SOS", "ACK")) return
+        if (id.isBlank() || kind !in setOf("SOS", "ACK")) {
+            addEvent("SYSTEM", "INVALID MESSAGE REJECTED", "Missing ID or unsupported kind from endpoint=$fromEndpoint")
+            return
+        }
         if (!seenIds.add(id)) {
             addEvent("SYSTEM", "Duplicate received", "$id · already processed; re-acknowledging if this is an SOS")
             // A retransmitted SOS must receive another ACK. Otherwise a lost ACK
@@ -471,7 +508,7 @@ class MainActivity : ComponentActivity() {
             "ACK" -> {
                 val originalId = envelope.optString("originalId")
                 removeOutbox(originalId)
-                addEvent("ACK", "SOS RECEIPT CONFIRMED", "SOS=$originalId · received by ${envelope.optString("ackBy")}. This confirms app-to-app receipt only.")
+                addEvent("ACK", "SOS ACKNOWLEDGED", "SOS=$originalId · processed by ${envelope.optString("ackBy")}. This confirms app-to-app receipt only, not emergency-services notification.")
                 if (ttl > 0) {
                     val forwarded = JSONObject(envelope.toString())
                         .put("ttl", ttl - 1)
@@ -559,10 +596,12 @@ class MainActivity : ComponentActivity() {
             addEvent("SYSTEM", "ACK NOT SENT", "The sender disconnected before the receipt acknowledgement could be delivered.")
             return
         }
+        sealEnvelopeIntegrity(envelope)
         val payload = Payload.fromBytes(envelope.toString().toByteArray(Charsets.UTF_8))
+        outgoingPayloads[payload.id] = TransferTrack(envelope.optString("originalId", envelope.optString("id")), envelope.optString("kind", "MESSAGE"), mutableSetOf(endpointId))
         client.sendPayload(endpointId, payload)
             .addOnSuccessListener {
-                addEvent("SYSTEM", "Receipt ACK queued", "Sent to the originating connected peer; this confirms app-to-app receipt only.")
+                addEvent("SYSTEM", "ACK SEND REQUEST ACCEPTED", "ACK payload=${payload.id} · endpoint=$endpointId. Waiting for transport result.")
             }
             .addOnFailureListener { e ->
                 addEvent("SYSTEM", "ACK SEND FAILED", e.localizedMessage ?: e.javaClass.simpleName)
@@ -575,14 +614,49 @@ class MainActivity : ComponentActivity() {
             addEvent("SYSTEM", "No relay recipients", "No eligible connected peers for this message.")
             return
         }
+        sealEnvelopeIntegrity(envelope)
         val payload = Payload.fromBytes(envelope.toString().toByteArray(Charsets.UTF_8))
+        outgoingPayloads[payload.id] = TransferTrack(envelope.optString("id"), envelope.optString("kind", "MESSAGE"), recipients.toMutableSet())
         client.sendPayload(recipients, payload)
             .addOnSuccessListener {
-                addEvent("SYSTEM", "Payload handed to nearby transport", "Target peers: ${recipients.size}. This is not proof of receipt; wait for SOS RECEIPT CONFIRMED.")
+                addEvent("SYSTEM", "${envelope.optString("kind", "MESSAGE")} SEND REQUEST ACCEPTED", "Message=${envelope.optString("id")} · target peers=${recipients.size}. Waiting for transport completion and then a recipient ACK.")
             }
             .addOnFailureListener { e ->
                 addEvent("SYSTEM", "SEND FAILED", "to ${recipients.size} peer(s): ${e.localizedMessage ?: e.javaClass.simpleName}")
             }
+    }
+
+    // SHA-256 checksum detects accidental payload corruption. It is deliberately NOT
+    // described as authentication: an attacker who can rewrite a message can recompute it.
+    private fun canonicalEnvelope(envelope: JSONObject): String {
+        val copy = JSONObject(envelope.toString())
+        copy.remove("integritySha256")
+        val keys = mutableListOf<String>()
+        val iterator = copy.keys()
+        while (iterator.hasNext()) keys += iterator.next()
+        keys.sort()
+        val canonical = JSONObject()
+        keys.forEach { key -> canonical.put(key, copy.get(key)) }
+        return canonical.toString()
+    }
+
+    private fun sealEnvelopeIntegrity(envelope: JSONObject) {
+        envelope.remove("integritySha256")
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(canonicalEnvelope(envelope).toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        envelope.put("integritySha256", digest)
+    }
+
+    private fun verifyEnvelopeIntegrity(envelope: JSONObject): Boolean {
+        val supplied = envelope.optString("integritySha256", "")
+        if (supplied.isBlank()) return false
+        val copy = JSONObject(envelope.toString())
+        copy.remove("integritySha256")
+        val expected = MessageDigest.getInstance("SHA-256")
+            .digest(canonicalEnvelope(copy).toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return MessageDigest.isEqual(supplied.toByteArray(Charsets.UTF_8), expected.toByteArray(Charsets.UTF_8))
     }
 
     private fun addEvent(kind: String, text: String, detail: String, latitude: Double? = null, longitude: Double? = null) {
