@@ -22,7 +22,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.core.content.ContextCompat
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
@@ -98,8 +107,25 @@ class MainActivity : ComponentActivity() {
         }
         loadSavedEvents()
         setContent {
-            MaterialTheme {
-                Surface(Modifier.fillMaxSize()) {
+            val resqColors = darkColorScheme(
+                primary = Color(0xFF51E0D0),
+                onPrimary = Color(0xFF062321),
+                secondary = Color(0xFF79A9FF),
+                background = Color(0xFF07111F),
+                surface = Color(0xFF101D2D),
+                surfaceVariant = Color(0xFF19283A),
+                onSurface = Color(0xFFEAF2FC),
+                onSurfaceVariant = Color(0xFFB4C2D5),
+                error = Color(0xFFFF647C),
+                errorContainer = Color(0xFF401D2A),
+                onErrorContainer = Color(0xFFFFDCE2),
+                primaryContainer = Color(0xFF123A3B),
+                onPrimaryContainer = Color(0xFFB9FFF4),
+                tertiaryContainer = Color(0xFF1D3150),
+                onTertiaryContainer = Color(0xFFD9E7FF)
+            )
+            MaterialTheme(colorScheme = resqColors) {
+                Surface(Modifier.fillMaxSize(), color = Color(0xFF07111F)) {
                     ResqScreen(
                         name = localName,
                         onNameChange = { localName = it.take(24) },
@@ -447,7 +473,7 @@ class MainActivity : ComponentActivity() {
             "No GPS coordinates attached (user-selected fallback)."
         }
         saveOutbox(id, envelope)
-        addEvent("SOS", "SOS QUEUED", "$id · $locationDetail · stored locally until an app peer acknowledges receipt", location?.latitude, location?.longitude)
+        addEvent("SOS", "SOS QUEUED", "Message: $clean · ID=$id · $locationDetail · stored locally until an app peer acknowledges receipt", location?.latitude, location?.longitude)
         if (connected.isEmpty()) {
             addEvent("SYSTEM", "SOS QUEUED — NOT DELIVERED", "No connected peers. The message is saved on this phone and will retry when a peer connects and the mesh is started.", location?.latitude, location?.longitude)
         } else {
@@ -694,181 +720,343 @@ private fun ResqScreen(
     onOpenMap: (Double, Double) -> Unit
 ) {
     var sosText by remember { mutableStateOf("Need assistance. Please check this location.") }
+    var eventFilter by remember { mutableStateOf("ALL") }
+    val bg = Color(0xFF07111F)
+    val panel = Color(0xFF101D2D)
+    val muted = Color(0xFF9FB0C5)
+    val cyan = Color(0xFF51E0D0)
+    val isError = status.contains("failed", true) || status.contains("denied", true)
+    val filteredEvents = when (eventFilter) {
+        "SOS" -> events.filter { it.kind.contains("SOS", true) || it.text.contains("SOS", true) }
+        "NETWORK" -> events.filter { it.kind.contains("PEER", true) || it.kind.contains("SYSTEM", true) || it.text.contains("connect", true) }
+        else -> events
+    }
 
     pendingPeers.lastOrNull()?.let { peer ->
         AlertDialog(
             onDismissRequest = { onRejectPeer(peer) },
             title = { Text("Verify nearby device") },
-            text = { Text("Device: ${peer.name}\nVerification code: ${peer.digits}\n\nOnly accept if the other phone shows the same code and you intend to connect.") },
-            confirmButton = { TextButton(onClick = { onAcceptPeer(peer) }) { Text("Code matches — connect") } },
+            text = { Text("Device: ${peer.name}\nVerification code: ${peer.digits}\n\nOnly connect if both phones show the same code.") },
+            confirmButton = { TextButton(onClick = { onAcceptPeer(peer) }) { Text("Code matches · Connect") } },
             dismissButton = { TextButton(onClick = { onRejectPeer(peer) }) { Text("Reject") } }
         )
     }
 
-    Scaffold(
-        topBar = {
-            Surface(shadowElevation = 3.dp) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                    Text("RESQMesh", style = MaterialTheme.typography.headlineMedium)
-                    Text(
-                        "OFFLINE SOS  •  FIELD TEST",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-            }
-        }
-    ) { padding ->
-        // One scrolling container for the entire screen. Previously the outer Column
-        // did not scroll, so the event log could be pushed below the viewport.
+    Scaffold(containerColor = bg) { padding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        "Prototype only — not a certified emergency service. Keep normal emergency options available.",
-                        modifier = Modifier.padding(12.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer
-                    )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(48.dp).clip(RoundedCornerShape(16.dp))
+                            .background(Brush.linearGradient(listOf(Color(0xFF51E0D0), Color(0xFF3484FF)))),
+                        contentAlignment = Alignment.Center
+                    ) { Text("R", color = Color(0xFF07111F), fontSize = 28.sp, fontWeight = FontWeight.Black) }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("RESQMesh", fontSize = 25.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                        Text("OFFLINE EMERGENCY NETWORK", fontSize = 10.sp, letterSpacing = 1.4.sp, color = cyan, fontWeight = FontWeight.Bold)
+                    }
+                    Column(horizontalAlignment = Alignment.End) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Box(Modifier.size(8.dp).clip(CircleShape).background(if (running) cyan else Color(0xFFFF647C)))
+                            Text(if (running) "ACTIVE" else "OFFLINE", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (running) cyan else Color(0xFFFF8A9B))
+                        }
+                        Text("v0.4.0", fontSize = 10.sp, color = muted)
+                    }
                 }
             }
 
             item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Device", style = MaterialTheme.typography.titleMedium)
-                        OutlinedTextField(
-                            value = name,
-                            onValueChange = onNameChange,
-                            label = { Text("Unique device name") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Text(
-                            status,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (status.contains("failed", true) || status.contains("denied", true))
-                                MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
-                        )
-                        Text("Location: $gpsStatus", style = MaterialTheme.typography.bodySmall)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = onStart, enabled = !running, modifier = Modifier.weight(1f)) {
-                                Text("Start mesh")
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = panel)
+                ) {
+                    Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("YOUR SAFETY NETWORK", fontSize = 10.sp, letterSpacing = 1.5.sp, color = muted, fontWeight = FontWeight.Bold)
+                                Text(if (running) "Mesh is running" else "Ready when you are", fontSize = 21.sp, fontWeight = FontWeight.Bold, color = Color.White)
                             }
-                            OutlinedButton(onClick = onStop, enabled = running, modifier = Modifier.weight(1f)) {
-                                Text("Stop")
+                            Box(Modifier.size(42.dp).clip(CircleShape).background(if (running) Color(0xFF123A3B) else Color(0xFF401D2A)), contentAlignment = Alignment.Center) {
+                                Text(if (running) "●" else "○", color = if (running) cyan else Color(0xFFFF8A9B), fontSize = 20.sp)
                             }
                         }
-                        Text(
-                            "Connected peers: ${peers.size}",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        if (peers.isNotEmpty()) {
-                            peers.forEach { peer ->
-                                Text("• $peer", style = MaterialTheme.typography.bodySmall)
+                        Text(status, fontSize = 13.sp, color = if (isError) Color(0xFFFF8A9B) else muted)
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            MetricTile("CONNECTED", peers.size.toString(), "nearby device${if (peers.size == 1) "" else "s"}", Modifier.weight(1f), cyan)
+                            MetricTile("EVENTS", events.size.toString(), "saved in timeline", Modifier.weight(1f), Color(0xFF79A9FF))
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(onClick = onStart, enabled = !running, modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
+                                Text("Start mesh", fontWeight = FontWeight.Bold)
                             }
-                        } else {
-                            Text("No peers connected yet.", style = MaterialTheme.typography.bodySmall)
+                            OutlinedButton(onClick = onStop, enabled = running, modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
+                                Text("Stop mesh")
+                            }
                         }
                     }
                 }
             }
 
             item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Send an SOS", style = MaterialTheme.typography.titleLarge)
+                Card(
+                    modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF251725))
+                ) {
+                    Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("EMERGENCY BROADCAST", fontSize = 10.sp, letterSpacing = 1.5.sp, color = Color(0xFFFFA4B1), fontWeight = FontWeight.Bold)
+                                Text("Send an SOS", fontSize = 23.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                            }
+                            Text("SOS", fontSize = 16.sp, fontWeight = FontWeight.Black, color = Color(0xFFFF647C), modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(Color(0xFF401D2A)).padding(horizontal = 12.dp, vertical = 8.dp))
+                        }
                         OutlinedTextField(
-                            value = sosText,
-                            onValueChange = { sosText = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            minLines = 3,
-                            label = { Text("Emergency message") },
-                            placeholder = { Text("Describe what help is needed") }
+                            value = sosText, onValueChange = { sosText = it }, modifier = Modifier.fillMaxWidth(),
+                            minLines = 2, label = { Text("What help do you need?") },
+                            placeholder = { Text("Describe the situation") }, shape = RoundedCornerShape(16.dp),
+                            colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = cyan, unfocusedBorderColor = Color(0xFF58313F))
                         )
                         Button(
-                            onClick = { onSend(sosText) },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Broadcast SOS with GPS")
+                            onClick = { onSend(sosText) }, modifier = Modifier.fillMaxWidth().height(56.dp),
+                            shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF647C), contentColor = Color(0xFF240811))
+                        ) { Text("SEND SOS WITH LOCATION  →", fontWeight = FontWeight.ExtraBold, letterSpacing = 0.4.sp) }
+                        OutlinedButton(onClick = { onSendWithoutGps(sosText) }, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(14.dp)) {
+                            Text("Send SOS without GPS", fontWeight = FontWeight.SemiBold)
                         }
-                        OutlinedButton(
-                            onClick = { onSendWithoutGps(sosText) },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Send without GPS")
-                        }
-                        Text(
-                            "A peer receipt confirms app-to-app delivery only. It does not contact emergency services.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
+                        Text("Delivery states are recorded in the event timeline. An app acknowledgement is not an emergency-service response.", fontSize = 11.sp, color = Color(0xFFFFB7C0))
                     }
                 }
             }
 
             item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                ) {
-                    Text("Event log", style = MaterialTheme.typography.titleLarge)
-                    Text("${events.size} events", style = MaterialTheme.typography.labelMedium)
-                }
-            }
-
-            if (events.isEmpty()) {
-                item {
-                    Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Text("No events yet", style = MaterialTheme.typography.titleSmall)
-                            Text(
-                                "Connection changes, SOS sends, received messages, GPS status and receipt acknowledgements will appear here.",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
-                    }
-                }
-            } else {
-                items(events, key = { it.id }) { event ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = when (event.kind) {
-                                "SOS" -> MaterialTheme.colorScheme.primaryContainer
-                                "ACK" -> MaterialTheme.colorScheme.tertiaryContainer
-                                else -> MaterialTheme.colorScheme.surfaceVariant
+                SectionHeading("Nearby network", "${peers.size} connected")
+                Spacer(Modifier.height(9.dp))
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+                    Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedTextField(value = name, onValueChange = onNameChange, label = { Text("This device's name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp))
+                        if (peers.isEmpty()) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Box(Modifier.size(36.dp).clip(CircleShape).background(Color(0xFF1D3150)), contentAlignment = Alignment.Center) { Text("⌁", color = Color(0xFF79A9FF), fontSize = 22.sp) }
+                                Column {
+                                    Text("No connected peers yet", fontWeight = FontWeight.SemiBold, color = Color.White)
+                                    Text("Start mesh on nearby test phones to discover them.", fontSize = 12.sp, color = muted)
+                                }
                             }
-                        )
-                    ) {
-                        Column(
-                            Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(5.dp)
-                        ) {
-                            Text("${event.kind}  •  ${event.text}", style = MaterialTheme.typography.titleSmall)
-                            Text(event.detail, style = MaterialTheme.typography.bodyMedium)
-                            if (event.latitude != null && event.longitude != null) {
-                                Text(
-                                    "Coordinates: ${event.latitude}, ${event.longitude}",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                TextButton(onClick = { onOpenMap(event.latitude, event.longitude) }) {
-                                    Text("OPEN LOCATION IN MAPS")
+                        } else {
+                            peers.forEach { peer ->
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Box(Modifier.size(36.dp).clip(CircleShape).background(Color(0xFF123A3B)), contentAlignment = Alignment.Center) { Text("●", color = cyan) }
+                                    Column(Modifier.weight(1f)) {
+                                        Text(peer, color = Color.White, fontWeight = FontWeight.SemiBold)
+                                        Text("Nearby connection established", fontSize = 11.sp, color = muted)
+                                    }
+                                    Text("LINKED", fontSize = 9.sp, color = cyan, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
                     }
                 }
             }
+
+            item {
+                SectionHeading("Location status", "GPS")
+                Spacer(Modifier.height(9.dp))
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Box(Modifier.size(42.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xFF1D3150)), contentAlignment = Alignment.Center) { Text("⌖", fontSize = 25.sp, color = Color(0xFF79A9FF)) }
+                        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Text("Location fix", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(gpsStatus, color = muted, fontSize = 12.sp)
+                            Text("GPS can work without mobile internet when a satellite fix is available. Cached coordinates may be old.", color = Color(0xFF79A9FF), fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+
+            item {
+                val sentMessages = events.filter { it.text.contains("SOS QUEUED", true) || it.text.contains("SOS SENT", true) || it.text.contains("SOS SENDING", true) }
+                SectionHeading("Sent SOS messages", "${sentMessages.size} logged")
+                Spacer(Modifier.height(9.dp))
+                if (sentMessages.isEmpty()) {
+                    InfoMessageCard("No sent SOS messages yet", "Messages you send, their location status, and delivery progress will appear here.", Color(0xFFFF8293), panel)
+                } else {
+                    sentMessages.take(5).forEach { event ->
+                        InfoMessageCard(event.text, event.detail, Color(0xFFFF8293), panel,
+                            coordinates = if (event.latitude != null && event.longitude != null) "${event.latitude}, ${event.longitude}" else null,
+                            onOpenMap = if (event.latitude != null && event.longitude != null) ({ onOpenMap(event.latitude, event.longitude) }) else null)
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
+            }
+
+            item {
+                SectionHeading("Received SOS messages", "${events.count { it.text.contains("SOS RECEIVED", true) }} received")
+                Spacer(Modifier.height(9.dp))
+                val receivedMessages = events.filter { it.text.contains("SOS RECEIVED", true) }
+                if (receivedMessages.isEmpty()) {
+                    InfoMessageCard("No incoming SOS messages", "SOS messages received from connected RESQMesh devices will appear in this inbox.", cyan, panel)
+                } else {
+                    receivedMessages.take(8).forEach { event ->
+                        InfoMessageCard(event.text, event.detail, cyan, panel,
+                            coordinates = if (event.latitude != null && event.longitude != null) "${event.latitude}, ${event.longitude}" else null,
+                            onOpenMap = if (event.latitude != null && event.longitude != null) ({ onOpenMap(event.latitude, event.longitude) }) else null)
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
+            }
+
+            item {
+                val connectivity = remember(events, peers.size) { buildConnectivityTrend(events, peers.size) }
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("NETWORK CONNECTIVITY", color = cyan, fontSize = 10.sp, letterSpacing = 1.3.sp, fontWeight = FontWeight.ExtraBold)
+                                Text("Your device's mesh links", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Text("${peers.size} linked", color = cyan, fontWeight = FontWeight.ExtraBold, fontSize = 13.sp)
+                        }
+                        Row(Modifier.fillMaxWidth().height(112.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Bottom) {
+                            val maxCount = (connectivity.maxOrNull() ?: 0).coerceAtLeast(1)
+                            connectivity.forEachIndexed { index, count ->
+                                Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
+                                    Text(count.toString(), fontSize = 10.sp, color = Color(0xFFB4C2D5))
+                                    Spacer(Modifier.height(4.dp))
+                                    Box(Modifier.fillMaxWidth(0.72f).height((12 + 66f * count / maxCount).dp).clip(RoundedCornerShape(topStart = 7.dp, topEnd = 7.dp)).background(if (index == connectivity.lastIndex) cyan else Color(0xFF426A91)))
+                                    Spacer(Modifier.height(5.dp))
+                                    Text(if (index == connectivity.lastIndex) "NOW" else "${index + 1}", fontSize = 9.sp, color = if (index == connectivity.lastIndex) cyan else Color(0xFF9FB0C5))
+                                }
+                            }
+                        }
+                        Text("Recent connection/disconnection events and the current live peer count. This is device-local history, not a count of every phone in the wider mesh.", color = Color(0xFF9FB0C5), fontSize = 11.sp)
+                    }
+                }
+            }
+
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Event timeline", fontSize = 21.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                        Text("SOS · delivery · acknowledgements · network", fontSize = 11.sp, color = muted)
+                    }
+                    Text("${events.size} total", fontSize = 11.sp, color = cyan, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(9.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("ALL", "SOS", "NETWORK").forEach { filter ->
+                        FilterChip(selected = eventFilter == filter, onClick = { eventFilter = filter }, label = { Text(filter) }, shape = RoundedCornerShape(12.dp))
+                    }
+                }
+            }
+
+            if (filteredEvents.isEmpty()) {
+                item {
+                    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+                        Column(Modifier.fillMaxWidth().padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("◎", fontSize = 30.sp, color = cyan)
+                            Text(if (events.isEmpty()) "Nothing to report yet" else "No events in this filter", fontWeight = FontWeight.Bold, color = Color.White)
+                            Text("Your activity will appear here as the mesh runs.", color = muted, fontSize = 12.sp)
+                        }
+                    }
+                }
+            } else {
+                items(filteredEvents, key = { it.id }) { event ->
+                    val eventColor = when {
+                        event.kind.contains("ACK", true) -> cyan
+                        event.kind.contains("SOS", true) -> Color(0xFFFF8293)
+                        event.text.contains("FAIL", true) || event.text.contains("ERROR", true) -> Color(0xFFFF8293)
+                        else -> Color(0xFF79A9FF)
+                    }
+                    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+                        Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(11.dp), verticalAlignment = Alignment.Top) {
+                            Box(Modifier.size(9.dp).padding(top = 3.dp).clip(CircleShape).background(eventColor))
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(event.kind.uppercase(), fontSize = 10.sp, color = eventColor, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.8.sp)
+                                }
+                                Text(event.text, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text(event.detail, color = muted, fontSize = 12.sp)
+                                if (event.latitude != null && event.longitude != null) {
+                                    Text("${event.latitude}, ${event.longitude}", color = cyan, fontSize = 11.sp)
+                                    TextButton(onClick = { onOpenMap(event.latitude, event.longitude) }, contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)) {
+                                        Text("OPEN OFFLINE MAP  ↗", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF251725))) {
+                    Text("SAFETY NOTE  ·  RESQMesh is an experimental peer-to-peer tool. It does not contact emergency services and is not a substitute for official emergency channels.", modifier = Modifier.padding(14.dp), color = Color(0xFFFFB7C0), fontSize = 11.sp)
+                }
+            }
         }
     }
 }
+
+private fun buildConnectivityTrend(events: List<UiEvent>, currentCount: Int): List<Int> {
+    val points = mutableListOf<Int>()
+    var count = currentCount.coerceAtLeast(0)
+    val networkEvents = events.filter { it.text.contains("Connected", true) || it.text.contains("Disconnected", true) }
+        .take(6).asReversed()
+    points.add(count)
+    networkEvents.forEach { event ->
+        if (event.text.contains("Connected", true) && !event.text.contains("Disconnected", true)) count = (count - 1).coerceAtLeast(0)
+        else if (event.text.contains("Disconnected", true)) count += 1
+        points.add(count)
+    }
+    return points.asReversed().takeLast(7).ifEmpty { listOf(currentCount.coerceAtLeast(0)) }
+}
+
+@Composable
+private fun InfoMessageCard(
+    title: String,
+    detail: String,
+    accent: Color,
+    panel: Color,
+    coordinates: String? = null,
+    onOpenMap: (() -> Unit)? = null
+) {
+    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(17.dp), colors = CardDefaults.cardColors(containerColor = panel)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(accent))
+                Text(title, color = accent, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+            }
+            Text(detail, color = Color(0xFFEAF2FC), fontSize = 12.sp, lineHeight = 17.sp)
+            if (coordinates != null) {
+                Text("LOCATION  ·  $coordinates", color = Color(0xFF79A9FF), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                if (onOpenMap != null) TextButton(onClick = onOpenMap, contentPadding = PaddingValues(0.dp)) { Text("OPEN MAP  ↗", color = Color(0xFF51E0D0), fontSize = 11.sp) }
+            } else {
+                Text("LOCATION  ·  Not attached", color = Color(0xFF9FB0C5), fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricTile(title: String, value: String, subtitle: String, modifier: Modifier = Modifier, accent: Color) {
+    Column(modifier.clip(RoundedCornerShape(16.dp)).background(Color(0xFF19283A)).padding(13.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(title, color = accent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
+        Text(value, color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.ExtraBold)
+        Text(subtitle, color = Color(0xFF9FB0C5), fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun SectionHeading(title: String, trailing: String) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, modifier = Modifier.weight(1f), fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+        Text(trailing, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF51E0D0))
+    }
+}
+
