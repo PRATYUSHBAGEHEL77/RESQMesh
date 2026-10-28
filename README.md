@@ -66,3 +66,14 @@ Record a video or screenshots and timestamped event logs for each run. Do not te
 ## Build through GitHub Actions
 
 Commit the project to GitHub, open **Actions → Build RESQMesh APK → Run workflow** (or push to `main`), and download the `RESQMesh-debug-APK` artifact only after the workflow succeeds. A green build is not a field-test pass.
+
+
+## v0.5.0 UI refresh
+
+- Reworked the main screen into a dark navy emergency dashboard with cyan/blue status accents.
+- Added clear mesh status and connected-peer/event count tiles.
+- Made the SOS composer prominent, with separate GPS and no-GPS send actions.
+- Added nearby-peer and GPS status panels, event timeline filters (All / SOS / Network), and more readable event cards.
+- Preserved the existing connection, SOS, GPS, acknowledgement, persistence, and map callbacks; UI state is sourced from the app rather than fabricated.
+
+Build status: source updated; compile and physical-device validation still required through GitHub Actions and the test phones.
