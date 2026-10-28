@@ -3,6 +3,7 @@ package com.resqmesh.app
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.location.Location
 import android.location.LocationListener
@@ -32,6 +33,8 @@ import java.util.concurrent.ConcurrentHashMap
 private const val SERVICE_ID = "com.resqmesh.app.SOS"
 private const val MAX_HOPS = 5
 
+data class PendingPeer(val endpointId: String, val name: String, val digits: String)
+
 data class UiEvent(
     val id: String,
     val kind: String,
@@ -47,6 +50,8 @@ class MainActivity : ComponentActivity() {
     private val connected = ConcurrentHashMap<String, String>() // endpointId -> endpointName
     private val seenIds = ConcurrentHashMap.newKeySet<String>()
     private val eventState = mutableStateListOf<UiEvent>()
+    private val pendingPeerState = mutableStateListOf<PendingPeer>()
+    private val prefs: SharedPreferences by lazy { getSharedPreferences("resqmesh_durable", MODE_PRIVATE) }
     private val peerState = mutableStateListOf<String>()
     private var localName by mutableStateOf("RESQ-Phone")
     private var status by mutableStateOf("Offline. Start mesh on each test phone.")
@@ -85,6 +90,7 @@ class MainActivity : ComponentActivity() {
             val model = Build.MODEL.orEmpty().replace(Regex("[^A-Za-z0-9]"), "").take(8).ifBlank { "Phone" }
             localName = "RESQ-$model-${androidId.takeLast(4)}"
         }
+        loadSavedEvents()
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -96,6 +102,9 @@ class MainActivity : ComponentActivity() {
                         running = running,
                         peers = peerState.toList(),
                         events = eventState.toList(),
+                        pendingPeers = pendingPeerState.toList(),
+                        onAcceptPeer = { acceptPeer(it) },
+                        onRejectPeer = { rejectPeer(it) },
                         onStart = { requestPermissionsAndStart() },
                         onStop = { stopMesh() },
                         onSend = { message -> requestGpsAndSend(message) },
@@ -199,8 +208,13 @@ class MainActivity : ComponentActivity() {
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            // Prototype accepts discovered peers automatically. Production needs explicit trust/authentication.
-            client.acceptConnection(endpointId, payloadCallback)
+            // Require explicit human confirmation of the same short authentication code on both phones.
+            val pending = PendingPeer(endpointId, info.endpointName, info.authenticationDigits)
+            runOnUiThread {
+                pendingPeerState.removeAll { it.endpointId == endpointId }
+                pendingPeerState.add(pending)
+                addEvent("SECURITY", "Peer verification required", "Compare code ${info.authenticationDigits} on both phones before accepting ${info.endpointName}.")
+            }
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
@@ -212,6 +226,7 @@ class MainActivity : ComponentActivity() {
                     if (!peerState.contains(endpointId)) peerState.add(endpointId)
                     status = "Connected to ${connected.size} peer(s). Internet is not required for this link."
                     addEvent("SYSTEM", "Connected", "endpoint=$endpointId")
+                    retryPendingOutbox()
                 }
                 else -> addEvent("SYSTEM", "Connection failed", "endpoint=$endpointId status=${result.status.statusCode}")
             }
@@ -397,15 +412,16 @@ class MainActivity : ComponentActivity() {
             .put("hops", 0)
             .put("path", org.json.JSONArray().put(localName))
         val locationDetail = if (location != null) {
-            "GPS ${location.latitude}, ${location.longitude} · ±${location.accuracy.toInt()} m · ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(location.time))}"
+            "GPS ${location.latitude}, ${location.longitude} · ±${location.accuracy.toInt()} m · age=${((System.currentTimeMillis() - location.time).coerceAtLeast(0L) / 1000)}s · provider=${location.provider}"
         } else {
             "No GPS coordinates attached (user-selected fallback)."
         }
-        addEvent("SOS", "SOS created", "$id · $locationDetail · waiting for peer receipt", location?.latitude, location?.longitude)
+        saveOutbox(id, envelope)
+        addEvent("SOS", "SOS QUEUED", "$id · $locationDetail · stored locally until an app peer acknowledges receipt", location?.latitude, location?.longitude)
         if (connected.isEmpty()) {
-            addEvent("SYSTEM", "SOS NOT SENT", "No connected peers. Keep the app open and retry when a peer connects.", location?.latitude, location?.longitude)
+            addEvent("SYSTEM", "SOS QUEUED — NOT DELIVERED", "No connected peers. The message is saved on this phone and will retry when a peer connects and the mesh is started.", location?.latitude, location?.longitude)
         } else {
-            broadcast(envelope, excludeEndpoint = null)
+            transmitOutbox(id, envelope)
         }
     }
 
@@ -414,7 +430,10 @@ class MainActivity : ComponentActivity() {
         val id = envelope.optString("id", "")
         if (id.isBlank() || kind !in setOf("SOS", "ACK")) return
         if (!seenIds.add(id)) {
-            addEvent("SYSTEM", "Duplicate ignored", id)
+            addEvent("SYSTEM", "Duplicate received", "$id · already processed; re-acknowledging if this is an SOS")
+            // A retransmitted SOS must receive another ACK. Otherwise a lost ACK
+            // makes a correctly received SOS look permanently undelivered.
+            if (kind == "SOS") sendAck(fromEndpoint, id)
             return
         }
 
@@ -436,19 +455,7 @@ class MainActivity : ComponentActivity() {
                 val receivedLat = if (latitudeValue is Number) latitudeValue.toDouble() else null
                 val receivedLon = if (longitudeValue is Number) longitudeValue.toDouble() else null
                 addEvent("SOS", "SOS RECEIVED from $origin", "$text · id=$id · hops=$hops$locationDetail", receivedLat, receivedLon)
-                // This ACK means this node received the SOS; it is not a rescue-service acknowledgement.
-                val ack = JSONObject()
-                    .put("kind", "ACK")
-                    .put("id", UUID.randomUUID().toString())
-                    .put("originalId", id)
-                    .put("ackBy", localName)
-                    .put("createdAt", System.currentTimeMillis())
-                    .put("ttl", MAX_HOPS)
-                    .put("hops", 0)
-                seenIds.add(ack.getString("id"))
-                // ACK must be sent BACK to the sender. Excluding fromEndpoint here
-                // accidentally prevented the original phone from ever seeing confirmation.
-                sendToEndpoint(fromEndpoint, ack)
+                sendAck(fromEndpoint, id)
                 if (ttl > 0) {
                     val forwarded = JSONObject(envelope.toString())
                         .put("ttl", ttl - 1)
@@ -456,11 +463,15 @@ class MainActivity : ComponentActivity() {
                     val oldPath = forwarded.optJSONArray("path") ?: org.json.JSONArray()
                     oldPath.put(localName)
                     forwarded.put("path", oldPath)
+                    // Persist the relay copy before forwarding so a later connection can retry it.
+                    saveOutbox(id, forwarded)
                     broadcast(forwarded, excludeEndpoint = fromEndpoint)
                 }
             }
             "ACK" -> {
-                addEvent("ACK", "SOS RECEIPT CONFIRMED", "SOS=${envelope.optString("originalId")} · received by ${envelope.optString("ackBy")}. This confirms app-to-app receipt only.")
+                val originalId = envelope.optString("originalId")
+                removeOutbox(originalId)
+                addEvent("ACK", "SOS RECEIPT CONFIRMED", "SOS=$originalId · received by ${envelope.optString("ackBy")}. This confirms app-to-app receipt only.")
                 if (ttl > 0) {
                     val forwarded = JSONObject(envelope.toString())
                         .put("ttl", ttl - 1)
@@ -469,6 +480,78 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun sendAck(endpointId: String, originalId: String) {
+        val ack = JSONObject()
+            .put("kind", "ACK")
+            .put("id", UUID.randomUUID().toString())
+            .put("originalId", originalId)
+            .put("ackBy", localName)
+            .put("createdAt", System.currentTimeMillis())
+            .put("ttl", MAX_HOPS)
+            .put("hops", 0)
+        seenIds.add(ack.getString("id"))
+        sendToEndpoint(endpointId, ack)
+    }
+
+    private fun saveOutbox(id: String, envelope: JSONObject) {
+        // SharedPreferences commit is synchronous: the SOS is persisted before transmission is attempted.
+        prefs.edit().putString("outbox_$id", envelope.toString()).commit()
+    }
+
+    private fun removeOutbox(id: String) {
+        if (id.isNotBlank()) prefs.edit().remove("outbox_$id").commit()
+    }
+
+    private fun transmitOutbox(id: String, envelope: JSONObject) {
+        if (connected.isEmpty()) return
+        addEvent("SYSTEM", "SOS TRANSMISSION ATTEMPT", "$id · peers=${connected.size}; awaiting recipient ACK")
+        broadcast(envelope, excludeEndpoint = null)
+    }
+
+    private fun retryPendingOutbox() {
+        val pending = prefs.all.entries.filter { it.key.startsWith("outbox_") && it.value is String }
+        if (pending.isEmpty()) return
+        addEvent("SYSTEM", "Retrying saved SOS messages", "${pending.size} pending message(s) will be retransmitted to connected peers.")
+        pending.forEach { entry ->
+            val raw = entry.value as? String ?: return@forEach
+            val envelope = runCatching { JSONObject(raw) }.getOrNull() ?: return@forEach
+            transmitOutbox(entry.key.removePrefix("outbox_"), envelope)
+        }
+    }
+
+    private fun acceptPeer(peer: PendingPeer) {
+        pendingPeerState.removeAll { it.endpointId == peer.endpointId }
+        client.acceptConnection(peer.endpointId, payloadCallback)
+            .addOnFailureListener { e -> addEvent("SECURITY", "Connection acceptance failed", e.localizedMessage ?: e.javaClass.simpleName) }
+    }
+
+    private fun rejectPeer(peer: PendingPeer) {
+        pendingPeerState.removeAll { it.endpointId == peer.endpointId }
+        client.rejectConnection(peer.endpointId)
+        addEvent("SECURITY", "Peer rejected", "Rejected ${peer.name} after verification prompt.")
+    }
+
+    private fun loadSavedEvents() {
+        val raw = prefs.getString("events_json", "[]") ?: "[]"
+        runCatching {
+            val array = org.json.JSONArray(raw)
+            for (i in 0 until array.length()) {
+                val o = array.getJSONObject(i)
+                eventState.add(UiEvent(o.optString("id"), o.optString("kind"), o.optString("text"), o.optString("detail"),
+                    if (o.isNull("lat")) null else o.optDouble("lat"), if (o.isNull("lon")) null else o.optDouble("lon")))
+            }
+        }
+    }
+
+    private fun persistEvents() {
+        val array = org.json.JSONArray()
+        eventState.take(150).forEach { e ->
+            array.put(JSONObject().put("id", e.id).put("kind", e.kind).put("text", e.text).put("detail", e.detail)
+                .put("lat", e.latitude ?: JSONObject.NULL).put("lon", e.longitude ?: JSONObject.NULL))
+        }
+        prefs.edit().putString("events_json", array.toString()).apply()
     }
 
     private fun sendToEndpoint(endpointId: String, envelope: JSONObject) {
@@ -506,6 +589,7 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             eventState.add(0, UiEvent(UUID.randomUUID().toString(), kind, text, detail, latitude, longitude))
             while (eventState.size > 150) eventState.removeAt(eventState.lastIndex)
+            persistEvents()
         }
     }
 
@@ -526,6 +610,9 @@ private fun ResqScreen(
     running: Boolean,
     peers: List<String>,
     events: List<UiEvent>,
+    pendingPeers: List<PendingPeer>,
+    onAcceptPeer: (PendingPeer) -> Unit,
+    onRejectPeer: (PendingPeer) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onSend: (String) -> Unit,
@@ -533,6 +620,16 @@ private fun ResqScreen(
     onOpenMap: (Double, Double) -> Unit
 ) {
     var sosText by remember { mutableStateOf("Need assistance. Please check this location.") }
+
+    pendingPeers.lastOrNull()?.let { peer ->
+        AlertDialog(
+            onDismissRequest = { onRejectPeer(peer) },
+            title = { Text("Verify nearby device") },
+            text = { Text("Device: ${peer.name}\nVerification code: ${peer.digits}\n\nOnly accept if the other phone shows the same code and you intend to connect.") },
+            confirmButton = { TextButton(onClick = { onAcceptPeer(peer) }) { Text("Code matches — connect") } },
+            dismissButton = { TextButton(onClick = { onRejectPeer(peer) }) { Text("Reject") } }
+        )
+    }
 
     Scaffold(
         topBar = {
